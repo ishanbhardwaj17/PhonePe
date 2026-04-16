@@ -1,6 +1,13 @@
-import User from '../models/user.model.js';
-import Transaction from '../models/transaction.model.js';
-import bcrypt from 'bcrypt';
+import User from "../models/user.model.js";
+import {
+  createFailedTransaction,
+  executeLedgerTransfer,
+} from "../services/payment.service.js";
+import { validateMpin } from "./txn.controller.js";
+
+function getIdempotencyKey(req) {
+  return req.headers["idempotency-key"] || req.body.idempotencyKey || null;
+}
 
 // @desc    Add mock money to wallet from linked bank
 // @route   POST /api/wallet/add-money
@@ -9,24 +16,57 @@ const addMoney = async (req, res) => {
   try {
     const amount = Number(req.body.amount);
     const userId = req.user._id;
+    const simulation = (req.body.simulation || "bank_success").toUpperCase();
+    const idempotencyKey = getIdempotencyKey(req);
 
     if (amount <= 0) {
-      return res.status(400).json({ message: 'Amount should be valid' });
+      return res.status(400).json({ message: "Amount should be valid" });
     }
 
     const user = await User.findById(userId);
-    user.balance += amount;
-    await user.save();
 
-    // Log addition transaction
-    const transaction = await Transaction.create({
-      sender: userId,
-      type: 'ADD_MONEY',
+    if (simulation === "BANK_FAILED") {
+      const { transaction, idempotentReplay } = await createFailedTransaction({
+        initiatedBy: userId,
+        receiver: user,
+        amount,
+        type: "ADD_MONEY",
+        note: "Wallet top-up failed",
+        idempotencyKey,
+        bankSimulation: "BANK_FAILED",
+        failureReason: "Simulated bank debit failure",
+        metadata: { topUpMode: "SIMULATION" },
+      });
+
+      return res.status(idempotentReplay ? 200 : 400).json({
+        message: "Bank simulation failed. Wallet was not credited.",
+        transaction,
+        balance: user.balance,
+        idempotentReplay,
+      });
+    }
+
+    const { transaction, idempotentReplay, balances } = await executeLedgerTransfer({
+      initiatedBy: userId,
+      sender: null,
+      receiver: user,
       amount,
-      status: 'SUCCESS',
+      type: "ADD_MONEY",
+      note: "Wallet top-up via bank simulation",
+      idempotencyKey,
+      bankSimulation: "BANK_SUCCESS",
+      settlementStatus: "SETTLED",
+      debitAccountCode: "bank_nodal_account",
+      creditAccountCode: undefined,
+      metadata: { topUpMode: "SIMULATION" },
     });
 
-    res.json({ message: `Successfully added ${amount} to wallet`, balance: user.balance, transaction });
+    res.status(idempotentReplay ? 200 : 201).json({
+      message: `Successfully added ${amount} to wallet`,
+      balance: balances?.receiverBalance ?? user.balance,
+      transaction,
+      idempotentReplay,
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -42,35 +82,39 @@ const payBill = async (req, res) => {
     const userId = req.user._id;
 
     if (!mpin) {
-        return res.status(400).json({ message: 'MPIN is required' });
+      return res.status(400).json({ message: "MPIN is required" });
     }
 
     const user = await User.findById(userId);
 
-    // Verify MPIN
-    if (!user.mpin) return res.status(400).json({ message: 'Please setup MPIN first' });
-    const isMpinCorrect = await bcrypt.compare(mpin.toString(), user.mpin);
-    if (!isMpinCorrect) return res.status(401).json({ message: 'Incorrect MPIN' });
+    await validateMpin(user, mpin);
 
     if (user.balance < amount) {
-      return res.status(400).json({ message: 'Insufficient wallet balance' });
+      return res.status(400).json({ message: "Insufficient wallet balance" });
     }
 
-    // Deduct Balance
-    user.balance -= amount;
-    await user.save();
-
-    const transaction = await Transaction.create({
-      sender: userId,
-      type: 'BILL_PAY',
-      billerName: billerName || 'Unknown Utility',
+    const { transaction, balances, idempotentReplay } = await executeLedgerTransfer({
+      initiatedBy: userId,
+      sender: user,
+      receiver: null,
       amount,
-      status: 'SUCCESS',
+      type: "BILL_PAY",
+      note: `Bill payment for ${billerName || "Unknown Utility"}`,
+      idempotencyKey: getIdempotencyKey(req),
+      billerName: billerName || "Unknown Utility",
+      settlementStatus: "SETTLED",
+      debitAccountCode: undefined,
+      creditAccountCode: "utility_biller_pool",
     });
 
-    res.json({ message: `Bill paid successfully for ${billerName}`, balance: user.balance, transaction });
+    res.status(idempotentReplay ? 200 : 201).json({
+      message: `Bill paid successfully for ${billerName}`,
+      balance: balances?.senderBalance ?? user.balance,
+      transaction,
+      idempotentReplay,
+    });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    res.status(error.statusCode || 500).json({ message: error.message });
   }
 };
 
