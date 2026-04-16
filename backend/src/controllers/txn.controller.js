@@ -4,7 +4,8 @@ import bcrypt from "bcrypt";
 
 async function sendMoney(req, res) {
   try {
-    const { receiverIdentifier, amount, mpin } = req.body;
+    const { receiverIdentifier, mpin } = req.body;
+    const amount = Number(req.body.amount);
     const senderId = req.user._id;
 
     if (!receiverIdentifier || !amount || !mpin) {
